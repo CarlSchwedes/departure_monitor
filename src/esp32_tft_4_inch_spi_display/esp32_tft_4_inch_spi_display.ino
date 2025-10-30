@@ -123,7 +123,7 @@ int fetchAndDisplayDepartures() {
         if (direction.length() > 19) direction = direction.substring(0, 19);
         while (direction.length() < 19) direction += " ";
 
-        String delta_time = (min_to_arrive == 0) ? "now" : String(min_to_arrive) + "\"";
+        String delta_time = (min_to_arrive == 0) ? "now" : String(min_to_arrive) + "\'";
         while (delta_time.length() < 4) delta_time = " " + delta_time;
 
         String description = decodeUtf8(direction) + delta_time;
