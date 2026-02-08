@@ -134,7 +134,7 @@ uint16_t getBackgroundColor(String product) {
 void showCountdown(int seconds) {
   for (int i = seconds; i >= 0; i--) {
     tft.fillRect(tft.width() / 4, tft.height() / 4, tft.width() * 3 / 4, tft.height() * 3 / 4, TFT_BLACK);
-    String message = "Refresh in " + String(i) + " sec...";
+    String message = "Restart in " + String(i) + " sec...";
     tft.setTextColor(TFT_RED, TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
     tft.drawString(message, tft.width() / 2, tft.height() / 2);
@@ -150,6 +150,8 @@ void displayError(const char* message) {
   tft.setTextColor(TFT_RED, TFT_BLACK);
   tft.println("Error:");
   tft.println(message);
+
+  showCountdown(10);
 }
 
 
@@ -337,12 +339,15 @@ void setup() {
   WiFi.begin(ssid, password);
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0);
-  tft.println("Connecting WiFi...");
+  tft.printf("Connecting WiFi");
   delay(1000);
 
+  int c = 0;
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
+    tft.printf(".");
+    c++;
+    if (c >= 20) ESP.restart();
   }
 
   Serial.println("WiFi connected");
@@ -366,13 +371,13 @@ void loop() {
     if(apiData[i].status == -1) {
       Serial.printf("API %d: JSON parsing failed\n", i);
       displayError("JSON parsing failed");
-      showCountdown(10);
+      ESP.restart();
     }
 
     if(apiData[i].status == -2) {
       Serial.printf("API %d: HTTP failed (code %d)\n", i, apiData[i].httpErrorCode);
       displayError("HTTP failed");
-      showCountdown(10);
+      ESP.restart();
     }
   }
 
