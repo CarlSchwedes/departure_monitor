@@ -6,7 +6,7 @@
 #include <time.h>
 
 #define DEPARTURES_FETCH_LIMIT 20
-#define JOURNEYS_FETCH_LIMIT 2
+#define JOURNEYS_FETCH_LIMIT 4
 #define JOURNEYS_TRANSFERS_LIMIT 1
 #define DEPARTURES_DISPLAY_LIMIT 11
 #define JOURNEYS_DISPLAY_LIMIT 1
@@ -41,6 +41,9 @@ struct ApiData {
 };
 
 ApiData apiData[NUM_APIS];
+
+WiFiClientSecure wifiClientSecure;
+HTTPClient http;
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -151,61 +154,102 @@ void displayError(const char* message) {
   tft.println("Error:");
   tft.println(message);
 
-  showCountdown(10);
+  showCountdown(3);
 }
 
 
-// Cleanup in loop() end:
-void cleanupApiData() {
-  for (int i = 0; i < NUM_APIS; i++) {
+// Cleanup
+void cleanupApiData(int i) {
+    apiData[i].status = 0;
+    apiData[i].httpErrorCode = 0;
+    apiData[i].payload = "";
     if (apiData[i].doc) {
       delete apiData[i].doc;
-      apiData[i].doc = nullptr;
     }
-  }
 }
 
 
 // Fetch ALL APIs -> store in global apiData[]
 void fetchApiData() {
   for (int i = 0; i < NUM_APIS; i++) {
-    apiData[i].status = 0;
-    apiData[i].httpErrorCode = 0;
-    apiData[i].payload = "";
-    if (apiData[i].doc) {
-      delete apiData[i].doc;  // Cleanup old
-    }
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      cleanupApiData(i);
 
-    WiFiClientSecure client;
-    client.setInsecure();
-    
-    HTTPClient http;
-    http.begin(client, apis[i].url);
-    http.addHeader("User-Agent", "ESP32-Display/1.0");
-    
-    int httpCode = http.GET();
-    apiData[i].httpErrorCode = httpCode;
-    if (httpCode != 200) {
-      Serial.printf("HTTP %d for API %d\n", httpCode, i);
-      apiData[i].status = -2;
+      http.begin(wifiClientSecure, apis[i].url);
+      http.addHeader("User-Agent", "ESP32-Display/1.0");
+      int httpCode = http.GET();
+
+      //apiData[i].httpErrorCode = httpCode;
+      if (httpCode != HTTP_CODE_OK) {
+        Serial.printf("HTTP %d for API %d\n", httpCode, i);
+        apiData[i].status = -2;
+        http.end();
+
+        // tft.fillScreen(TFT_BLACK);
+        // tft.setTextSize(2);
+        // tft.setCursor(0, 0);
+        // tft.setTextColor(TFT_RED, TFT_BLACK);
+        // tft.println("attempt " + String(attempt) + " httpCode: " + String(httpCode));
+        // delay(5000);
+        
+        continue;
+      }
+      
+      apiData[i].payload = http.getString();
+      Serial.printf("API %d payload: %d bytes\n", i, apiData[i].payload.length());
+      
+
+      // 2. basic sanity check on payload
+      if (apiData[i].payload.length() == 0) {
+        Serial.printf("API %d: Empty payload (EmptyInput likely)\n", i);
+        apiData[i].status = -1;
+
+        // tft.fillScreen(TFT_BLACK);
+        // tft.setTextSize(2);
+        // tft.setCursor(0, 0);
+        // tft.setTextColor(TFT_RED, TFT_BLACK);
+        // tft.println("attempt " + String(attempt) + " payload: Empty payload (EmptyInput likely)");
+        // delay(5000);
+
+        continue;
+      }
+
+      // 3. heuristic: must start with '{' or '['
+      if (apiData[i].payload[0] != '{' && apiData[i].payload[0] != '[') {
+        Serial.printf("API %d: payload does not start with JSON object/array\n", i);
+        Serial.printf("Payload preview: %.60s\n", apiData[i].payload.c_str());
+        apiData[i].status = -1;
+
+        // tft.fillScreen(TFT_BLACK);
+        // tft.setTextSize(2);
+        // tft.setCursor(0, 0);
+        // tft.setTextColor(TFT_RED, TFT_BLACK);
+        // tft.println("attempt " + String(attempt) + " heuristic: must start with '{' or '['");
+        // delay(5000);
+
+        continue;
+      }
+
+      apiData[i].doc = new DynamicJsonDocument(apis[i].jsonCapacity);
+      DeserializationError error = deserializeJson(*apiData[i].doc, apiData[i].payload);
       http.end();
-      continue;
-    }
-    
-    apiData[i].payload = http.getString();
-    Serial.printf("API %d payload: %d bytes\n", i, apiData[i].payload.length());
-    
-    apiData[i].doc = new DynamicJsonDocument(apis[i].jsonCapacity);
-    DeserializationError error = deserializeJson(*apiData[i].doc, apiData[i].payload);
-    http.end();
-    
-    if (error) {
-      Serial.printf("JSON error API %d: %s\n", i, error.c_str());
-      apiData[i].status = -1;
-      delete apiData[i].doc;
-      apiData[i].doc = nullptr;
-    } else {
+      
+      if (error) {
+        Serial.printf("JSON error API %d: %s\n", i, error.c_str());
+        apiData[i].status = -1;
+
+        // tft.fillScreen(TFT_BLACK);
+        // tft.setTextSize(2);
+        // tft.setCursor(0, 0);
+        // tft.setTextColor(TFT_RED, TFT_BLACK);
+        // tft.println("attempt " + String(attempt) + " error: " + String(error.c_str()));
+        // delay(5000);
+
+        continue;
+      }
+
       apiData[i].status = 0;  // OK
+      break;
     }
   }
 }
@@ -333,33 +377,42 @@ void setup() {
   tft.setTextSize(1);
   tft.setCursor(0, 0);
   tft.println("Starting...");
-  delay(1000);
+  delay(500);
 
   // ====== Connect WiFi
   WiFi.begin(ssid, password);
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0);
   tft.printf("Connecting WiFi");
-  delay(1000);
+  delay(500);
 
   int c = 0;
-  while (WiFi.status() != WL_CONNECTED) {
+  while (WiFi.status() != WL_CONNECTED && c < 20) {
     delay(500);
     tft.printf(".");
     c++;
-    if (c >= 20) ESP.restart();
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    tft.fillScreen(TFT_BLACK);
+    tft.println("WiFi failed!");
+    delay(3000);
+    // don't restart; let loop() retry later or just spin
+    return;  // let loop() handle next retry
   }
 
   Serial.println("WiFi connected");
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0);
   tft.println("WiFi connected");
-  delay(1000);
+  delay(500);
 
   // ====== Configure time for Europe/Berlin
   configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
-  delay(1000);
+  delay(500);
 
+  wifiClientSecure.setInsecure();      // global TLS setup
+  wifiClientSecure.setTimeout(10000);
 }
 
 
@@ -367,22 +420,18 @@ void loop() {
   fetchApiData();        // Fetch ALL APIs once
   displayAllData();      // Display everything
 
-  for (int i = 0; i < NUM_APIS; i++) {
-    if(apiData[i].status == -1) {
-      Serial.printf("API %d: JSON parsing failed\n", i);
-      displayError("JSON parsing failed");
-      ESP.restart();
-    }
+  // for (int i = 0; i < NUM_APIS; i++) {
+  //   if(apiData[i].status == -1) {
+  //     Serial.printf("API %d: JSON parsing failed\n", i);
+  //     displayError("JSON parsing failed");
+  //   }
 
-    if(apiData[i].status == -2) {
-      Serial.printf("API %d: HTTP failed (code %d)\n", i, apiData[i].httpErrorCode);
-      displayError("HTTP failed");
-      ESP.restart();
-    }
-  }
+  //   if(apiData[i].status == -2) {
+  //     Serial.printf("API %d: HTTP failed (code %d)\n", i, apiData[i].httpErrorCode);
+  //     displayError("HTTP failed");
+  //   }
+  // }
 
-  cleanupApiData();  // Free memory each cycle
   delay(60000);
-
 }
 
