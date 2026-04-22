@@ -13,6 +13,8 @@
 #define MAX_TRANSFER_TIME 6
 #define MIN_TO_ARRIVE_THRESHOLD 3
 
+bool serialPrintForDebugPurpose = false;
+
 // ====== WiFi credentials
 const char* ssid = "";
 const char* password = "";
@@ -26,8 +28,8 @@ struct ApiConfig {
 
 // VBB API configurations
 const ApiConfig apis[] = {
-  { "https://v6.vbb.transport.rest/stops/900096458/departures?duration=60&remarks=false&results=" + String(DEPARTURES_FETCH_LIMIT), 16384, DEPARTURES_DISPLAY_LIMIT },  // departures
-  { "https://v6.vbb.transport.rest/journeys?duration=60&from=900096458&to=900001202&products=U&suburban=false&transfers=" + String(JOURNEYS_TRANSFERS_LIMIT) + "&via=900009203&results=" + String(JOURNEYS_FETCH_LIMIT), 4096, JOURNEYS_DISPLAY_LIMIT }  // journeys
+  { "https://v6.vbb.transport.rest/stops/900096458/departures?duration=60&remarks=false&results=" + String(DEPARTURES_FETCH_LIMIT), 32768, DEPARTURES_DISPLAY_LIMIT },  // departures
+  { "https://v6.vbb.transport.rest/journeys?duration=60&from=900096458&to=900001202&products=U&suburban=false&transfers=" + String(JOURNEYS_TRANSFERS_LIMIT) + "&via=900009203&remarks=false&verkehrsunternehmen=false&polyline=false&language=en&format=compact&results=" + String(JOURNEYS_FETCH_LIMIT), 65536, JOURNEYS_DISPLAY_LIMIT }  // journeys
 };
 
 const int NUM_APIS = sizeof(apis) / sizeof(apis[0]);
@@ -37,13 +39,9 @@ struct ApiData {
   int status = 0;                     // 0=ok, -1=json, -2=http
   int httpErrorCode = 0;              // http status
   DynamicJsonDocument* doc = nullptr;
-  String payload = "";                // for debugging
 };
 
-ApiData apiData[NUM_APIS];
-
-WiFiClientSecure wifiClientSecure;
-HTTPClient http;
+ApiData apiData[NUM_APIS] = {};
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -134,13 +132,13 @@ uint16_t getBackgroundColor(String product) {
 } 
 
 
-void showCountdown(int seconds) {
+void showCountdownMessage(int seconds, const char* message) {
   for (int i = seconds; i >= 0; i--) {
     tft.fillRect(tft.width() / 4, tft.height() / 4, tft.width() * 3 / 4, tft.height() * 3 / 4, TFT_BLACK);
-    String message = "Restart in " + String(i) + " sec...";
+    String msg = String(message) + " " + String(i) + " sec...";
     tft.setTextColor(TFT_RED, TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString(message, tft.width() / 2, tft.height() / 2);
+    tft.drawString(msg, tft.width() / 2, tft.height() / 2);
     delay(1000);
   }
 }
@@ -154,101 +152,124 @@ void displayError(const char* message) {
   tft.println("Error:");
   tft.println(message);
 
-  showCountdown(3);
+  showCountdownMessage(3, "Restart in");
 }
 
 
-// Cleanup
+void displayWiFiOk() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(0, 0);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.println("WiFi Ok!");
+
+  showCountdownMessage(10, "Loop over in");
+}
+
+
 void cleanupApiData(int i) {
     apiData[i].status = 0;
     apiData[i].httpErrorCode = 0;
-    apiData[i].payload = "";
     if (apiData[i].doc) {
       delete apiData[i].doc;
+      apiData[i].doc = nullptr;
     }
+}
+
+
+template <typename... Args>
+void serialPrintfDebug(const char* dbgMsg, Args... args) {
+  if (serialPrintForDebugPurpose) {
+    Serial.printf(dbgMsg, args...);
+  }
+}
+
+
+void handleApiError(int apiIndex, int apiStatus, HTTPClient& http, WiFiClientSecure& client, int delayMs = 500) {
+  Serial.printf("\t\tERROR: API %d failed\n", apiIndex);
+  apiData[apiIndex].status = apiStatus;
+  http.end();
+  client.stop();
+  delay(delayMs);
 }
 
 
 // Fetch ALL APIs -> store in global apiData[]
 void fetchApiData() {
   for (int i = 0; i < NUM_APIS; i++) {
-    for (int attempt = 1; attempt <= 3; attempt++) {
+    serialPrintfDebug<int>("API: %i\n", i);
+
+    for (int attempt = 0; attempt <= 2; attempt++) {
+      serialPrintfDebug<int>("\tATTEMPT: %i\n", attempt);
+
       cleanupApiData(i);
 
-      http.begin(wifiClientSecure, apis[i].url);
+      // Fresh client EVERY TIME
+      WiFiClientSecure client;
+      client.setInsecure();
+      client.setTimeout(30000);
+      
+      HTTPClient http;
+      http.useHTTP10(true);
+      http.setReuse(false);
+      http.begin(client, apis[i].url);
       http.addHeader("User-Agent", "ESP32-Display/1.0");
+      http.setTimeout(20000);
+
       int httpCode = http.GET();
+      yield();  // Keep connection alive; prevents ESP32 watchdog resets
+      serialPrintfDebug<int>("\tHTTP-Code GET: %i\n", httpCode);
 
-      //apiData[i].httpErrorCode = httpCode;
+      // ERROR Handling
       if (httpCode != HTTP_CODE_OK) {
-        Serial.printf("HTTP %d for API %d\n", httpCode, i);
-        apiData[i].status = -2;
-        http.end();
-
-        // tft.fillScreen(TFT_BLACK);
-        // tft.setTextSize(2);
-        // tft.setCursor(0, 0);
-        // tft.setTextColor(TFT_RED, TFT_BLACK);
-        // tft.println("attempt " + String(attempt) + " httpCode: " + String(httpCode));
-        // delay(5000);
-        
-        continue;
-      }
-      
-      apiData[i].payload = http.getString();
-      Serial.printf("API %d payload: %d bytes\n", i, apiData[i].payload.length());
-      
-
-      // 2. basic sanity check on payload
-      if (apiData[i].payload.length() == 0) {
-        Serial.printf("API %d: Empty payload (EmptyInput likely)\n", i);
-        apiData[i].status = -1;
-
-        // tft.fillScreen(TFT_BLACK);
-        // tft.setTextSize(2);
-        // tft.setCursor(0, 0);
-        // tft.setTextColor(TFT_RED, TFT_BLACK);
-        // tft.println("attempt " + String(attempt) + " payload: Empty payload (EmptyInput likely)");
-        // delay(5000);
-
+        Serial.printf("\t\tERROR: HTTP %i\n", httpCode);
+        apiData[i].httpErrorCode = httpCode;
+        handleApiError(i, -2, http, client);
         continue;
       }
 
-      // 3. heuristic: must start with '{' or '['
-      if (apiData[i].payload[0] != '{' && apiData[i].payload[0] != '[') {
-        Serial.printf("API %d: payload does not start with JSON object/array\n", i);
-        Serial.printf("Payload preview: %.60s\n", apiData[i].payload.c_str());
-        apiData[i].status = -1;
+      String payload = http.getString();
+      yield();  // Keep connection alive; prevents ESP32 watchdog resets
+      serialPrintfDebug<int>("\tPayload bytes: %d\n", payload.length());
+      serialPrintfDebug<const char*>("\tPayload preview: %.120s\n", payload.c_str());
+      
+      // ERROR Handling
+      if (payload.length() == 0) {
+        Serial.printf("\t\tERROR: Empty payload (EmptyInput likely)\n");
+        handleApiError(i, -1, http, client);
+        continue;
+      }
 
-        // tft.fillScreen(TFT_BLACK);
-        // tft.setTextSize(2);
-        // tft.setCursor(0, 0);
-        // tft.setTextColor(TFT_RED, TFT_BLACK);
-        // tft.println("attempt " + String(attempt) + " heuristic: must start with '{' or '['");
-        // delay(5000);
-
+      // ERROR Handling
+      if (payload[0] != '{' && payload[0] != '[') {
+        Serial.printf("\t\tERROR: Payload JSON object/array; heuristic: must start with '{' or '['\n");
+        handleApiError(i, -1, http, client);
         continue;
       }
 
       apiData[i].doc = new DynamicJsonDocument(apis[i].jsonCapacity);
-      DeserializationError error = deserializeJson(*apiData[i].doc, apiData[i].payload);
-      http.end();
-      
+      DeserializationError error = deserializeJson(*apiData[i].doc, payload);
+
       if (error) {
-        Serial.printf("JSON error API %d: %s\n", i, error.c_str());
-        apiData[i].status = -1;
-
-        // tft.fillScreen(TFT_BLACK);
-        // tft.setTextSize(2);
-        // tft.setCursor(0, 0);
-        // tft.setTextColor(TFT_RED, TFT_BLACK);
-        // tft.println("attempt " + String(attempt) + " error: " + String(error.c_str()));
-        // delay(5000);
-
+        Serial.printf("\tJSON error: %s\n", error.c_str());
+        delete apiData[i].doc; 
+        apiData[i].doc = nullptr;
+        handleApiError(i, -1, http, client);
         continue;
       }
 
-      apiData[i].status = 0;  // OK
+      String preview;
+      serializeJson(*apiData[i].doc, preview);
+      serialPrintfDebug<const char*>("\tJSON preview: %.120s\n", preview.c_str());
+      serialPrintfDebug<int>("\tJSON length: %d\n", preview.length());
+
+      apiData[i].status = 0;
+      serialPrintfDebug<int>("\t\tAPI Status OK: %i\n", apiData[i].status);
+
+      http.end();
+      client.stop();
+
+      delay(500);
       break;
     }
   }
@@ -257,11 +278,21 @@ void fetchApiData() {
 
 // Display DEPARTURES (API 0)
 void displayDepartures() {
-  if (apiData[0].status != 0) return;
+  if (apiData[0].status != 0 || !apiData[0].doc) {
+    tft.println("No departures ...");
+    return;
+  }
   
   JsonArray deps = (*apiData[0].doc)["departures"];
+  serialPrintfDebug<int>("-> Departures array size: %d\n", deps.size());  // Debug!
+  
   if (deps.isNull()) return;
   
+  if (deps.isNull() || deps.size() == 0) {
+    tft.println("No departures found ...");
+    return;
+  }
+
   int count = 0;
   for (JsonObject dep : deps) {
     if (count >= apis[0].displayLimit) break;
@@ -269,7 +300,7 @@ void displayDepartures() {
     String line = dep["line"]["name"].as<String>();
     String direction = dep["direction"].as<String>();
     String product = dep["line"]["product"].as<String>();
-    int min_to_arrive = getMinutesToDeparture(dep["plannedWhen"].as<String>());
+    int min_to_arrive = getMinutesToDeparture(dep["when"].as<String>());
     
     if (min_to_arrive < MIN_TO_ARRIVE_THRESHOLD) continue;
     
@@ -288,20 +319,28 @@ void displayDepartures() {
     count++;
   }
   
-  if (count == 0) tft.println("No departures");
+  if (count == 0) tft.println("No departures ...");
 }
 
 
 // Display JOURNEYS (API 1)
 void displayJourneys() {
-  if (apiData[1].status != 0) return;
-  
-  JsonArray journeys = (*apiData[1].doc)["journeys"];
-  if (journeys.isNull()) return;
-
   int count = DEPARTURES_DISPLAY_LIMIT;
   // draw thin separator line
   tft.drawLine(0, (count * (tft.fontHeight() + 3)) - 2, tft.width() - 1, (count * (tft.fontHeight() + 3)) - 2, TFT_WHITE);
+
+  if (apiData[1].status != 0 || !apiData[1].doc) {
+    tft.drawString("No journeys data ...", 0, DEPARTURES_DISPLAY_LIMIT * (tft.fontHeight() + 3));
+    return;
+  }
+  
+  JsonArray journeys = (*apiData[1].doc)["journeys"];
+  serialPrintfDebug<int>("-> Journeys array size: %d\n", journeys.size());  // Debug!
+
+  if (journeys.isNull() || journeys.size() == 0) {
+    tft.drawString("No journeys found ...", 0, DEPARTURES_DISPLAY_LIMIT * (tft.fontHeight() + 3));
+    return;
+  }
 
   for (JsonObject jrny : journeys) {
 
@@ -313,8 +352,8 @@ void displayJourneys() {
     String destination = jrny["legs"][2]["destination"]["name"].as<String>();
     String product2 = jrny["legs"][2]["line"]["product"].as<String>();
 
-    int min_to_arrive = getMinutesToDeparture(jrny["legs"][0]["plannedDeparture"].as<String>());
-    int transfer_time = getMinutesBetween(jrny["legs"][0]["plannedArrival"].as<String>(), jrny["legs"][2]["plannedDeparture"].as<String>());
+    int min_to_arrive = getMinutesToDeparture(jrny["legs"][0]["departure"].as<String>());
+    int transfer_time = getMinutesBetween(jrny["legs"][0]["arrival"].as<String>(), jrny["legs"][2]["departure"].as<String>());
 
     uint16_t background0 = getBackgroundColor(product0);
     uint16_t background2 = getBackgroundColor(product2);
@@ -369,6 +408,7 @@ void displayAllData() {
 
 void setup() {
   Serial.begin(115200);
+  delay(100);
 
   tft.begin();
   tft.setRotation(1);
@@ -405,14 +445,10 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0);
   tft.println("WiFi connected");
-  delay(500);
 
   // ====== Configure time for Europe/Berlin
   configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
   delay(500);
-
-  wifiClientSecure.setInsecure();      // global TLS setup
-  wifiClientSecure.setTimeout(10000);
 }
 
 
@@ -420,18 +456,5 @@ void loop() {
   fetchApiData();        // Fetch ALL APIs once
   displayAllData();      // Display everything
 
-  // for (int i = 0; i < NUM_APIS; i++) {
-  //   if(apiData[i].status == -1) {
-  //     Serial.printf("API %d: JSON parsing failed\n", i);
-  //     displayError("JSON parsing failed");
-  //   }
-
-  //   if(apiData[i].status == -2) {
-  //     Serial.printf("API %d: HTTP failed (code %d)\n", i, apiData[i].httpErrorCode);
-  //     displayError("HTTP failed");
-  //   }
-  // }
-
   delay(60000);
 }
-
