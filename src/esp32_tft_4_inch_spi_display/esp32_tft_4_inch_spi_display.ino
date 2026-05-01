@@ -10,10 +10,13 @@
 #define JOURNEYS_TRANSFERS_LIMIT 1
 #define DEPARTURES_DISPLAY_LIMIT 11
 #define JOURNEYS_DISPLAY_LIMIT 1
-#define MAX_TRANSFER_TIME 6
+#define MAX_TRANSFER_TIME 10
 #define MIN_TO_ARRIVE_THRESHOLD 3
 
 bool serialPrintForDebugPurpose = false;
+
+unsigned long lastFetchMs = 0UL;
+unsigned long lastDisplayMs = 0UL;
 
 // ====== WiFi credentials
 const char* ssid = "";
@@ -36,15 +39,18 @@ const int NUM_APIS = sizeof(apis) / sizeof(apis[0]);
 
 // Global data storage (fetched once per loop)
 struct ApiData {
-  int status = 0;                     // 0=ok, -1=json, -2=http
+  int status = 0;                     // 1=valid, 0=fetch-ok, -1=json, -2=http
+  bool stale = false;
   int httpErrorCode = 0;              // http status
+  DynamicJsonDocument* temp = nullptr;
   DynamicJsonDocument* doc = nullptr;
+  unsigned long lastSuccessMs = 0UL;
+  bool INIT_FETCH_VALID = false;
 };
 
 ApiData apiData[NUM_APIS] = {};
 
 TFT_eSPI tft = TFT_eSPI();
-
 
 // Helper: Parse ISO string -> time_t
 time_t parseIsoToTime(const String& isoTimeStr) {
@@ -60,6 +66,16 @@ time_t parseIsoToTime(const String& isoTimeStr) {
   t.tm_isdst = -1;
   
   return mktime(&t);
+}
+
+
+String timeToIsoString(time_t t) {
+  struct tm tmTime;
+  localtime_r(&t, &tmTime);
+
+  char buf[25];  // "2026-04-24T13:05:00"
+  strftime(buf, sizeof(buf), "%Y-%m-%iT%H:%M:%S", &tmTime);
+  return String(buf);
 }
 
 
@@ -169,10 +185,17 @@ void displayWiFiOk() {
 
 void cleanupApiData(int i) {
     apiData[i].status = 0;
+    apiData[i].stale = false;
     apiData[i].httpErrorCode = 0;
+    apiData[i].INIT_FETCH_VALID = false;
+    apiData[i].lastSuccessMs = 0UL;
     if (apiData[i].doc) {
       delete apiData[i].doc;
       apiData[i].doc = nullptr;
+    }
+    if (apiData[i].temp) {
+      delete apiData[i].temp;
+      apiData[i].temp = nullptr;
     }
 }
 
@@ -185,8 +208,8 @@ void serialPrintfDebug(const char* dbgMsg, Args... args) {
 }
 
 
-void handleApiError(int apiIndex, int apiStatus, HTTPClient& http, WiFiClientSecure& client, int delayMs = 500) {
-  Serial.printf("\t\tERROR: API %d failed\n", apiIndex);
+void handleApiError(int apiIndex, int apiStatus, HTTPClient& http, WiFiClientSecure& client, int delayMs = 100) {
+  serialPrintfDebug<int, int>("\t\t ERROR: API<%i> failed to fetch; STATUS: %i\n", apiIndex, apiStatus);
   apiData[apiIndex].status = apiStatus;
   http.end();
   client.stop();
@@ -196,75 +219,86 @@ void handleApiError(int apiIndex, int apiStatus, HTTPClient& http, WiFiClientSec
 
 // Fetch ALL APIs -> store in global apiData[]
 void fetchApiData() {
+  serialPrintfDebug("Fetching...\n");
   for (int i = 0; i < NUM_APIS; i++) {
     serialPrintfDebug<int>("API: %i\n", i);
 
-    for (int attempt = 0; attempt <= 2; attempt++) {
-      serialPrintfDebug<int>("\tATTEMPT: %i\n", attempt);
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+      delay(2000);
+      if (WiFi.status() != WL_CONNECTED) 
+        serialPrintfDebug("Failed to reconnect WiFi, restart!\n");
+        ESP.restart();
+    }
 
-      cleanupApiData(i);
+    for (int attempt = 0; attempt <= 2; attempt++) {
+      serialPrintfDebug<int>("\t ATTEMPT: %i\n", attempt);
 
       // Fresh client EVERY TIME
       WiFiClientSecure client;
       client.setInsecure();
-      client.setTimeout(30000);
+      client.setTimeout(10000);
       
       HTTPClient http;
-      http.useHTTP10(true);
-      http.setReuse(false);
+      http.useHTTP10(true); // use HTTP/1.0 instead of default HTTP/1.1; HTTP/1.0 avoids trying to keep socket alive -> client typically sends Connection: close
+      http.setReuse(false); // HTTPClient forced not to reuse TCP connection for next request; reduces bugs where ESP32 accidentally reuses a stale or wrong connection
       http.begin(client, apis[i].url);
       http.addHeader("User-Agent", "ESP32-Display/1.0");
-      http.setTimeout(20000);
+      http.setTimeout(10000);
 
+      unsigned long t = millis();
       int httpCode = http.GET();
+      apiData[i].httpErrorCode = httpCode;
+      serialPrintfDebug<unsigned long>("\t http.GET() took %lu ms\n", millis() - t);
       yield();  // Keep connection alive; prevents ESP32 watchdog resets
-      serialPrintfDebug<int>("\tHTTP-Code GET: %i\n", httpCode);
+      serialPrintfDebug<int>("\t HTTP-Code GET: %i\n", httpCode);
 
       // ERROR Handling
       if (httpCode != HTTP_CODE_OK) {
-        Serial.printf("\t\tERROR: HTTP %i\n", httpCode);
-        apiData[i].httpErrorCode = httpCode;
         handleApiError(i, -2, http, client);
         continue;
       }
 
+      t = millis();
       String payload = http.getString();
-      yield();  // Keep connection alive; prevents ESP32 watchdog resets
-      serialPrintfDebug<int>("\tPayload bytes: %d\n", payload.length());
-      serialPrintfDebug<const char*>("\tPayload preview: %.120s\n", payload.c_str());
+      serialPrintfDebug<unsigned long>("\t http.getString() took %lu ms\n", millis() - t);
+      //yield();  // Keep connection alive; prevents ESP32 watchdog resets
+      serialPrintfDebug<int>("\t Payload bytes: %i\n", payload.length());
+      serialPrintfDebug<int>("\t Expected bytes: %i\n", http.getSize());
+      serialPrintfDebug<const char*>("\t Payload preview: %.60s\n", payload.c_str());
       
       // ERROR Handling
       if (payload.length() == 0) {
-        Serial.printf("\t\tERROR: Empty payload (EmptyInput likely)\n");
+        serialPrintfDebug("\t\t ERROR: Empty payload (EmptyInput likely)\n");
         handleApiError(i, -1, http, client);
         continue;
       }
 
       // ERROR Handling
       if (payload[0] != '{' && payload[0] != '[') {
-        Serial.printf("\t\tERROR: Payload JSON object/array; heuristic: must start with '{' or '['\n");
+        serialPrintfDebug("\t\t ERROR: Payload JSON must start with '{' or '['\n");
         handleApiError(i, -1, http, client);
         continue;
       }
 
-      apiData[i].doc = new DynamicJsonDocument(apis[i].jsonCapacity);
-      DeserializationError error = deserializeJson(*apiData[i].doc, payload);
+      apiData[i].temp = new DynamicJsonDocument(apis[i].jsonCapacity);
+      DeserializationError error = deserializeJson(*apiData[i].temp, payload);
 
       if (error) {
-        Serial.printf("\tJSON error: %s\n", error.c_str());
-        delete apiData[i].doc; 
-        apiData[i].doc = nullptr;
+        serialPrintfDebug<const char*>("\t ERROR: deserializeJson: %s\n", error.c_str());
         handleApiError(i, -1, http, client);
         continue;
       }
 
-      String preview;
-      serializeJson(*apiData[i].doc, preview);
-      serialPrintfDebug<const char*>("\tJSON preview: %.120s\n", preview.c_str());
-      serialPrintfDebug<int>("\tJSON length: %d\n", preview.length());
+      if (serialPrintForDebugPurpose && !error) {
+        String preview;
+        serializeJson(*apiData[i].temp, preview);
+        serialPrintfDebug<const char*>("\t JSON preview: %.60s\n", preview.c_str());
+        serialPrintfDebug<int>("\t JSON length: %i\n", preview.length());
+      }
 
       apiData[i].status = 0;
-      serialPrintfDebug<int>("\t\tAPI Status OK: %i\n", apiData[i].status);
+      serialPrintfDebug<int>("\t Status-Code: %i\n", apiData[i].status);
 
       http.end();
       client.stop();
@@ -276,22 +310,234 @@ void fetchApiData() {
 }
 
 
+bool validateDeparturesDoc(DynamicJsonDocument& doc) {
+  serialPrintfDebug("\t Validating departures...\n");
+    if (doc.isNull()) {
+    serialPrintfDebug("\t ERROR: DynamicJsonDocument doc is NULL\n");
+    return false;
+  }
+
+  if (!doc["departures"].is<JsonArray>()) {
+    serialPrintfDebug("\t ERROR: Departures not of type <JsonArray>\n");
+    return false;
+  }
+
+  JsonArray deps = doc["departures"].as<JsonArray>();
+  if (deps.isNull()) {
+    serialPrintfDebug("\t ERROR: Departures <JsonArray> is NULL\n");
+    return false;
+  }
+  
+  if (deps.size() == 0) {
+    serialPrintfDebug("\t ERROR: Departures <JsonArray> size 0\n");
+    return false;
+  }
+
+  JsonObject first = deps[0];
+  if (first.isNull()) {
+    serialPrintfDebug("\t ERROR: Departures <JsonObject> deps[0] is NULL\n");
+    return false;
+  }
+  if (!first["when"].is<const char*>()) {
+    serialPrintfDebug("\t ERROR: Departures <JsonObject> deps[0][\"when\"] is not of type <const char*>\n");
+    return false;
+  }
+  if (!first["line"]["name"].is<const char*>()) {
+    serialPrintfDebug("\t ERROR: Departures <JsonObject> deps[0][\"line\"][\"name\"] is not of type <const char*>\n");
+    return false;
+  }
+  if (!first["direction"].is<const char*>()) {
+    serialPrintfDebug("\t ERROR: Departures <JsonObject> deps[0][\"direction\"] is not of type <const char*>\n");
+    return false;
+  }
+
+  return true;
+}
+
+
+bool validateJourneysDoc(DynamicJsonDocument& doc) {
+  serialPrintfDebug("\t Validating journeys...\n");
+  if (doc.isNull()) {
+    serialPrintfDebug("\t ERROR: DynamicJsonDocument doc is NULL\n");
+    return false;
+  }
+
+  if (!doc["journeys"].is<JsonArray>()) {
+    serialPrintfDebug("\t ERROR: Journeys not of type <JsonArray>\n");
+    return false;
+  }
+
+  JsonArray journeys = doc["journeys"].as<JsonArray>();
+  if (journeys.isNull()) {
+    serialPrintfDebug("\t ERROR: Journeys <JsonArray> is NULL\n");
+    return false;
+  }
+  if (journeys.size() == 0) {
+    serialPrintfDebug("\t ERROR: Journeys <JsonArray> size 0\n");
+    return false;
+  }
+
+  JsonObject first = journeys[0];
+  if (first.isNull()) {
+    serialPrintfDebug("\t ERROR: Journeys <JsonObject> journeys[0] is NULL\n");
+    return false;
+  }
+  if (!first["legs"].is<JsonArray>()) {
+    serialPrintfDebug("\t ERROR: Journeys <JsonObject> journeys[0][\"legs\"] is not of type <JsonArray>\n");
+    return false;
+  }
+
+  JsonArray legs = first["legs"].as<JsonArray>();
+  if (legs.size() < 1) {
+    serialPrintfDebug("\t ERROR: Journeys journeys[0][\"legs\"] size 0\n");
+    return false;
+  }
+
+  return true;
+}
+
+
+bool validateApiDoc(int apiIndex, DynamicJsonDocument& doc) {
+  switch (apiIndex) {
+    case 0: return validateDeparturesDoc(doc);
+    case 1: return validateJourneysDoc(doc);
+    default: return false;
+  }
+}
+
+
+void validateApiData() {
+  serialPrintfDebug("Validating...\n");
+  for (int i = 0; i < NUM_APIS; i++) {
+
+    if (i == 0 && apiData[i].status == 0 && serialPrintForDebugPurpose) {
+      JsonArray deps = (*apiData[0].temp)["departures"].as<JsonArray>();
+      String preview;
+      serializeJson(deps, preview);
+      serialPrintfDebug<int, int, const char*>("\t DOC<%i>: %i items: %.80s\n", i, deps.size(), preview.c_str());
+    }
+    if (i == 1 && apiData[i].status == 0 && serialPrintForDebugPurpose) {
+      JsonArray jrny = (*apiData[1].temp)["journeys"].as<JsonArray>();
+      String preview;
+      serializeJson(jrny, preview);
+      serialPrintfDebug<int, int, const char*>("\t DOC<%i>: %i items: %.80s\n", i, jrny.size(), preview.c_str());
+    }
+
+    if (apiData[i].status == 0 && validateApiDoc(i, (*apiData[i].temp))) {
+      apiData[i].INIT_FETCH_VALID = true;
+      apiData[i].status = 1;
+      delete apiData[i].doc;
+      apiData[i].doc = new DynamicJsonDocument(*apiData[i].temp);
+
+      delete apiData[i].temp;
+      apiData[i].temp = nullptr;
+      apiData[i].lastSuccessMs = millis(); // set age of successful fetch to current time
+
+      if (i == 0 && serialPrintForDebugPurpose) {
+        JsonArray deps = (*apiData[0].doc)["departures"].as<JsonArray>();
+        String preview;
+        serializeJson(deps, preview);
+        serialPrintfDebug<int, int, const char*>("\t\t DOC<%i>: %i items: %.80s\n", i, deps.size(), preview.c_str());
+      }
+      if (i == 1 && serialPrintForDebugPurpose) {
+        JsonArray journeys = (*apiData[1].doc)["journeys"].as<JsonArray>();
+        String preview;
+        serializeJson(journeys, preview);
+        serialPrintfDebug<int, int, const char*>("\t\t DOC<%i>: %i items: %.80s\n", i, journeys.size(), preview.c_str());
+      }
+
+      serialPrintfDebug<int>("\t API<%i> Valid Json; LastSuccess: %lu ms\n", i, apiData[i].lastSuccessMs);
+    }
+    else {
+      delete apiData[i].temp;
+      apiData[i].temp = nullptr;
+      serialPrintfDebug<int>("\t API<%i> Invalid Json; LastSuccess: %lu ms; Age: %i ms\n", i, apiData[i].lastSuccessMs, millis() - apiData[i].lastSuccessMs);
+    }
+    serialPrintfDebug("\t --------\n");
+  }
+}
+
+
+void staleJsonDeparturesDoc(unsigned long ageMs) {
+  JsonArray deps = (*apiData[0].doc)["departures"].as<JsonArray>();
+
+  serialPrintfDebug("\t\t Adjusted mins: ");
+  for (JsonObject dep : deps) {
+    time_t correctedTime = parseIsoToTime(dep["when"].as<String>()) - (ageMs / 60000);
+    dep["when"] = timeToIsoString(correctedTime);
+
+    serialPrintfDebug("depWhen: %s\n", dep["when"].as<String>());
+
+    serialPrintfDebug<int>("%i ", getMinutesToDeparture(dep["when"].as<String>()));
+  }
+  serialPrintfDebug("\n");
+}
+
+
+void staleJsonJourneysDoc(unsigned long ageMs) {
+  JsonArray journeys = (*apiData[1].doc)["journeys"].as<JsonArray>();
+
+  serialPrintfDebug("\t\t Adjusted mins: ");
+  for (JsonObject jrny : journeys) {
+    time_t correctedTime = parseIsoToTime(jrny["legs"][0]["departure"].as<String>()) - (ageMs / 60000);
+    jrny["legs"][0]["departure"] = timeToIsoString(correctedTime);
+
+    serialPrintfDebug("jrnyLegsDepartures: %s\n", jrny["legs"][0]["departure"].as<String>());
+
+    serialPrintfDebug<int>("%i ", getMinutesToDeparture(jrny["legs"][0]["departure"].as<String>()));
+  }
+  serialPrintfDebug("\n");
+}
+
+
+void handleStaleJSON() {
+  serialPrintfDebug("Handling stale json...\n");
+  for (int i = 0; i < NUM_APIS; i++) {
+    if (apiData[i].INIT_FETCH_VALID) {
+      unsigned long ageMs = millis() - apiData[i].lastSuccessMs;
+
+      serialPrintfDebug<int, int>("\t API<%i>-STATUS: %i\n", i, apiData[i].status);
+      serialPrintfDebug<unsigned long>("\t\t age: %lu\n", ageMs);
+
+      if (apiData[i].status != 1 && ageMs > 60000 && ageMs < 180000) { // handle stale json data (of current invalid fetch)
+        apiData[i].stale = true;
+        serialPrintfDebug("\t\t Updating with STALE-JSON...\n");
+        //if (i == 0) staleJsonDeparturesDoc(ageMs);
+        //if (i == 1) staleJsonJourneysDoc(ageMs);
+      }
+      else if (ageMs > 180000) {
+        ESP.restart();  // Instant full reset
+        //cleanupApiData(i);
+        //serialPrintfDebug("\t\t Cleaned and reseted API struct from outdated JSON!\n");
+      }
+      else if (apiData[i].status == 1) {
+        apiData[i].stale = false;
+        serialPrintfDebug("\t\t Object not stale. Continue...\n");
+      }
+    }
+  }
+}
+
+
 // Display DEPARTURES (API 0)
 void displayDepartures() {
-  if (apiData[0].status != 0 || !apiData[0].doc) {
+
+  if (!apiData[0].doc) {
     tft.println("No departures ...");
     return;
   }
   
   JsonArray deps = (*apiData[0].doc)["departures"];
-  serialPrintfDebug<int>("-> Departures array size: %d\n", deps.size());  // Debug!
+  serialPrintfDebug<int>("\t -> Departures array size: %i\n", deps.size());  // Debug!
   
-  if (deps.isNull()) return;
+  // if (deps.isNull()) return;
   
-  if (deps.isNull() || deps.size() == 0) {
-    tft.println("No departures found ...");
-    return;
-  }
+  // if (deps.isNull() || deps.size() == 0) {
+  //   tft.println("No departures found ...");
+  //   return;
+  // }
+
+  uint16_t tft_color = apiData[0].stale ? TFT_LIGHTGREY : TFT_WHITE;
 
   int count = 0;
   for (JsonObject dep : deps) {
@@ -314,7 +560,7 @@ void displayDepartures() {
     String delta = (min_to_arrive <= 0) ? "now" : String(min_to_arrive) + "'";
     while (delta.length() < 4) delta = " " + delta;
     
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(tft_color, TFT_BLACK);
     tft.drawString(direction + delta, 65, count * (tft.fontHeight() + 3));
     count++;
   }
@@ -329,18 +575,20 @@ void displayJourneys() {
   // draw thin separator line
   tft.drawLine(0, (count * (tft.fontHeight() + 3)) - 2, tft.width() - 1, (count * (tft.fontHeight() + 3)) - 2, TFT_WHITE);
 
-  if (apiData[1].status != 0 || !apiData[1].doc) {
+  if (!apiData[1].doc) {
     tft.drawString("No journeys data ...", 0, DEPARTURES_DISPLAY_LIMIT * (tft.fontHeight() + 3));
     return;
   }
   
   JsonArray journeys = (*apiData[1].doc)["journeys"];
-  serialPrintfDebug<int>("-> Journeys array size: %d\n", journeys.size());  // Debug!
+  serialPrintfDebug<int>("\t -> Journeys array size: %i\n", journeys.size());  // Debug!
 
-  if (journeys.isNull() || journeys.size() == 0) {
-    tft.drawString("No journeys found ...", 0, DEPARTURES_DISPLAY_LIMIT * (tft.fontHeight() + 3));
-    return;
-  }
+  // if (journeys.isNull() || journeys.size() == 0) {
+  //   tft.drawString("No journeys found ...", 0, DEPARTURES_DISPLAY_LIMIT * (tft.fontHeight() + 3));
+  //   return;
+  // }
+
+  uint16_t tft_color = apiData[1].stale ? TFT_LIGHTGREY : TFT_WHITE;
 
   for (JsonObject jrny : journeys) {
 
@@ -373,11 +621,11 @@ void displayJourneys() {
       while (delta_time.length() < 4) delta_time = " " + delta_time;
 
       String description = decodeUtf8(direction0);
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setTextColor(tft_color, TFT_BLACK);
       tft.drawString(description, 65, count * (tft.fontHeight() + 3));
 
       description = decodeUtf8(destination) + delta_time;
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setTextColor(tft_color, TFT_BLACK);
       tft.drawString(description, 260, count * (tft.fontHeight() + 3));
 
       count++;
@@ -401,6 +649,8 @@ void displayAllData() {
   tft.setTextSize(3);
   tft.setCursor(0, 0);
 
+  serialPrintfDebug("Displaying...\n");
+
   displayDepartures();
   displayJourneys();
 }
@@ -417,6 +667,7 @@ void setup() {
   tft.setTextSize(1);
   tft.setCursor(0, 0);
   tft.println("Starting...");
+  serialPrintfDebug("Starting...\n");
   delay(500);
 
   // ====== Connect WiFi
@@ -424,6 +675,7 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0);
   tft.printf("Connecting WiFi");
+  serialPrintfDebug("Connecting WiFi\n");
   delay(500);
 
   int c = 0;
@@ -436,25 +688,48 @@ void setup() {
   if (WiFi.status() != WL_CONNECTED) {
     tft.fillScreen(TFT_BLACK);
     tft.println("WiFi failed!");
-    delay(3000);
-    // don't restart; let loop() retry later or just spin
+    serialPrintfDebug("WiFi failed!\n");
+    //delay(3000);
+
+    ESP.restart();
     return;  // let loop() handle next retry
   }
 
-  Serial.println("WiFi connected");
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0);
   tft.println("WiFi connected");
+  serialPrintfDebug("WiFi connected\n");
 
   // ====== Configure time for Europe/Berlin
   configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
-  delay(500);
+
+  // Trigger initial fetches immediately
+  lastFetchMs = millis() - 31000;   // Pretend last fetch 29s ago → fetch NOW
+  lastDisplayMs = millis() - 61000; // Pretend last display 59s ago → display NOW
+
+  delay(100);
 }
 
 
 void loop() {
-  fetchApiData();        // Fetch ALL APIs once
-  displayAllData();      // Display everything
+  unsigned long now = millis();
+  
+  // Fetch APIs every 30s
+  if (now - lastFetchMs >= 30000) {
+    fetchApiData();    // Fetch ALL APIs once
+    validateApiData(); // Validate JSON objects
+    handleStaleJSON(); // In case fetch failed
+    lastFetchMs = now;
+  }
+  
+  // Redraw every 60s (uses latest data)
+  if (now - lastDisplayMs >= 60000) {
+    displayAllData();  // Display everything
+    lastDisplayMs = now;
+  }
+  
+  serialPrintfDebug<int, int, int>("\nFree heap: %d/%d; [%d%% usage]\n", ESP.getFreeHeap(), ESP.getHeapSize(), (1.0-(ESP.getFreeHeap()/(float)ESP.getHeapSize()))*100.0);
+  serialPrintfDebug("--------\n");
 
-  delay(60000);
+  delay(15000);
 }
